@@ -1,0 +1,98 @@
+# Go Setup Composite Action
+# Reusable action for setting up Go development environment
+# Includes caching, tool installation, and dependency management
+#
+# Usage:
+#   steps:
+#     - uses: ./.github/actions/setup-go
+#       with:
+#         go-version: '1.23'
+#         working-directory: backend
+
+name: 'Setup Go Environment'
+description: 'Setup Go with caching and tooling for CI/CD'
+
+inputs:
+  go-version:
+    description: 'Go version to install'
+    required: false
+    default: '1.23'
+  working-directory:
+    description: 'Working directory for Go commands'
+    required: false
+    default: 'backend'
+  install-golangci-lint:
+    description: 'Install golangci-lint'
+    required: false
+    default: 'true'
+  golangci-lint-version:
+    description: 'golangci-lint version'
+    required: false
+    default: 'v1.62.2'
+  cache-dependency-path:
+    description: 'Path to go.sum for cache key'
+    required: false
+    default: 'backend/go.sum'
+
+outputs:
+  go-version:
+    description: 'Installed Go version'
+    value: ${{ steps.setup-go.outputs.go-version }}
+  cache-hit:
+    description: 'Whether the cache was hit'
+    value: ${{ steps.setup-go.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Go
+      id: setup-go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: true
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+    - name: Verify Go installation
+      shell: bash
+      run: |
+        echo "Go version: $(go version)"
+        echo "Go environment:"
+        go env GOROOT GOPATH GOCACHE
+
+    - name: Download dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Downloading Go modules..."
+        go mod download
+        go mod verify
+        echo "Dependencies downloaded successfully"
+
+    - name: Install golangci-lint
+      if: inputs.install-golangci-lint == 'true'
+      shell: bash
+      run: |
+        echo "Installing golangci-lint ${{ inputs.golangci-lint-version }}..."
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | \
+          sh -s -- -b $(go env GOPATH)/bin ${{ inputs.golangci-lint-version }}
+        golangci-lint --version
+
+    - name: Install additional Go tools
+      shell: bash
+      run: |
+        echo "Installing additional Go tools..."
+        # Install gotestsum for better test output
+        go install gotest.tools/gotestsum@latest
+        echo "Go tools installed successfully"
+
+    - name: Cache Go build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: go-build-${{ runner.os }}-${{ inputs.go-version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          go-build-${{ runner.os }}-${{ inputs.go-version }}-
+          go-build-${{ runner.os }}-

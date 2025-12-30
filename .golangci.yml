@@ -1,0 +1,182 @@
+# .golangci.yml - Go linting configuration for CI/CD Training Application
+# This configuration enforces code quality standards for the Go backend
+
+run:
+  # Timeout for analysis
+  timeout: 5m
+  # Include test files
+  tests: true
+
+output:
+  # Print lines of code with issue
+  print-issued-lines: true
+  # Print linter name in the end of issue text
+  print-linter-name: true
+  # Sort results by: filepath, line and column
+  sort-results: true
+  formats:
+    - format: colored-line-number
+
+linters:
+  disable-all: true
+  enable:
+    # Bug detectors
+    - errcheck      # Check for unchecked errors
+    - gosec         # Security problems
+    - govet         # Reports suspicious constructs
+    - staticcheck   # Go static analysis
+    - nilerr        # Find ignoring errors on nil values
+
+    # Style
+    - gofmt         # Format code
+    - gci           # Gci control
+    - gocritic      # Style check
+    - revive        # Fast, configurable, extensible, flexible, and beautiful linter
+    - goimports     # Manage import lines
+    - misspell      # Fix spelling mistakes
+
+    # Complexity
+    - gocyclo       # Cyclomatic complexity
+    - gocognit      # Cognitive complexity
+    - funlen        # Function length
+
+    # Unused code
+    - unused        # Find unused code
+
+    # Performance
+    - prealloc      # Find slice declarations that could potentially be preallocated
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+  gosec:
+    includes:
+      - G101 # Look for hard coded credentials
+      - G102 # Bind to all interfaces
+      - G103 # Audit the use of unsafe block
+      - G104 # Audit errors not checked
+      - G201 # SQL query construction
+      - G202 # SQL query construction
+      - G301 # Poor file permissions used when creating a directory
+      - G302 # Poor file permissions used when creation file or using chmod
+      - G303 # Creating tempfile using a predictable path
+      - G304 # File path provided as taint input
+      - G305 # File traversal when extracting zip archive
+      - G401 # Detect the usage of DES, RC4, MD5 or SHA1
+      - G402 # Look for bad TLS connection settings
+      - G403 # Ensure minimum RSA key length of 2048 bits
+      - G404 # Insecure random number source (rand)
+      - G501 # Import blocklist: crypto/md5
+      - G502 # Import blocklist: crypto/des
+      - G503 # Import blocklist: crypto/rc4
+      - G504 # Import blocklist: net/http/cgi
+      - G505 # Import blocklist: crypto/sha1
+      - G601 # Implicit memory aliasing of items from a range statement
+
+  govet:
+    enable-all: true
+    disable:
+      - shadow
+      - fieldalignment  # Too pedantic for training app
+      - unusedwrite     # Too pedantic for test fixtures
+
+  gocyclo:
+    min-complexity: 15
+
+  gocognit:
+    min-complexity: 20
+
+  funlen:
+    lines: 100
+    statements: 50
+
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+      - name: if-return
+      - name: increment-decrement
+      - name: var-naming
+      - name: var-declaration
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unexported-return
+      - name: indent-error-flow
+      - name: errorf
+      - name: empty-block
+      - name: superfluous-else
+      - name: unused-parameter
+      - name: unused-receiver
+      - name: redefines-builtin-id
+
+  gci:
+    sections:
+      - Standard
+      - Default
+      - Prefix(github.com/Nuttapong14/go-github-actions)
+
+issues:
+  # Maximum issues count per one linter
+  max-issues-per-linter: 0
+  # Maximum count of issues with the same text
+  max-same-issues: 0
+  # Show only new issues
+  new: false
+  # Fix found issues (if it's supported by the linter)
+  fix: false
+  # Make issues output unique by line
+  uniq-by-line: true
+  # Exclude dirs
+  exclude-dirs:
+    - vendor
+    - third_party
+    - testdata
+    - examples
+    - Godeps
+    - builtin
+  # Exclude files
+  exclude-files:
+    - ".*\\.pb\\.go$"
+
+  exclude-rules:
+    # Exclude some linters from running on tests files
+    - path: _test\.go
+      linters:
+        - gocyclo
+        - errcheck
+        - dupl
+        - gosec
+        - goconst
+        - funlen  # Test setup functions are often long
+
+    # GORM BeforeCreate hooks require tx parameter even if unused
+    - text: "unused-parameter: parameter 'tx' seems to be unused"
+      linters:
+        - revive
+
+    # Exclude known linters from partially hard-vendored code
+    - path: internal/hmac/
+      text: "weak cryptographic primitive"
+
+    # Exclude some staticcheck messages
+    - linters:
+        - staticcheck
+      text: "SA9003:"
+
+    # Exclude lll issues for long lines with go:generate
+    - linters:
+        - lll
+      source: "^//go:generate "
+
+severity:
+  default-severity: error

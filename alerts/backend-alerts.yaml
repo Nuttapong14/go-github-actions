@@ -1,0 +1,60 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: backend-alerts
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: cicd-training
+spec:
+  groups:
+    - name: backend.rules
+      rules:
+        - alert: BackendDown
+          expr: up{job="backend"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Backend is down"
+            description: "No healthy backend targets for 2 minutes."
+
+        - alert: BackendHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{job="backend",status=~"5.."}[5m]))
+              /
+            sum(rate(http_requests_total{job="backend"}[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High backend error rate"
+            description: "5xx error rate is above 5% for 5 minutes."
+
+        - alert: BackendLatencyHigh
+          expr: |
+            histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="backend"}[5m])) by (le)) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High backend latency"
+            description: "p95 latency over 500ms for 10 minutes."
+
+        - alert: HealthCheckSlow
+          expr: |
+            histogram_quantile(0.95, sum(rate(health_check_duration_seconds_bucket[5m])) by (le)) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Health check duration high"
+            description: "p95 health check duration over 500ms for 10 minutes."
+
+        - alert: DeploymentFailures
+          expr: increase(deployments_total{status="failed"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Deployment failures detected"
+            description: "One or more deployments failed in the last 15 minutes."

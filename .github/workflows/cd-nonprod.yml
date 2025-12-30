@@ -1,0 +1,268 @@
+# CD NonProd Deployment Workflow
+# Manual promotion from beta to nonprod with approval gate
+# Uses pre-built images and promotes by retagging
+
+name: CD NonProd
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to promote (default: latest)'
+        required: false
+        default: 'latest'
+
+concurrency:
+  group: cd-nonprod
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+  KUSTOMIZE_VERSION: v5.3.0
+  ENVIRONMENT: nonprod
+  NAMESPACE: nonprod
+  HEALTH_CHECK_RETRIES: 5
+  HEALTH_CHECK_DELAY: 10
+
+jobs:
+  promote-images:
+    name: Promote Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      source-tag: ${{ steps.tag.outputs.source }}
+      image-tag: ${{ steps.tag.outputs.promoted }}
+    steps:
+      - name: Set image tag
+        id: tag
+        run: |
+          SOURCE_TAG="${{ inputs.image_tag }}"
+          if [ -z "$SOURCE_TAG" ]; then
+            SOURCE_TAG="latest"
+          fi
+          PROMOTED_TAG="nonprod-${SOURCE_TAG}"
+          echo "source=$SOURCE_TAG" >> $GITHUB_OUTPUT
+          echo "promoted=$PROMOTED_TAG" >> $GITHUB_OUTPUT
+          echo "Promoting tag: $SOURCE_TAG -> $PROMOTED_TAG"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote backend image
+        run: |
+          docker pull ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.source }}
+          docker tag ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker tag ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.BACKEND_IMAGE }}:nonprod-latest
+          docker push ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker push ${{ env.BACKEND_IMAGE }}:nonprod-latest
+
+      - name: Promote frontend image
+        run: |
+          docker pull ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.source }}
+          docker tag ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker tag ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.FRONTEND_IMAGE }}:nonprod-latest
+          docker push ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker push ${{ env.FRONTEND_IMAGE }}:nonprod-latest
+
+  deploy:
+    name: Deploy to NonProd
+    runs-on: ubuntu-latest
+    needs: promote-images
+    permissions:
+      contents: read
+    environment:
+      name: nonprod
+      url: https://nonprod.example.com
+    outputs:
+      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
+      previous-tag: ${{ steps.current.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - name: Get current deployment tag (for rollback)
+        id: current
+        run: |
+          # In a real scenario, this would query the cluster
+          echo "tag=previous-${{ needs.promote-images.outputs.image-tag }}" >> $GITHUB_OUTPUT
+
+      - name: Update Kustomize images
+        run: |
+          cd k8s/overlays/nonprod
+          kustomize edit set image \
+            backend=${{ env.BACKEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }} \
+            frontend=${{ env.FRONTEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }}
+
+      - name: Validate Kustomize build
+        run: |
+          kustomize build k8s/overlays/nonprod > /tmp/manifests.yaml
+          echo "Generated manifests:"
+          cat /tmp/manifests.yaml
+
+      - name: Deploy to cluster
+        id: deploy
+        run: |
+          # In a real scenario, this would apply to the cluster:
+          # kubectl apply -k k8s/overlays/nonprod
+
+          DEPLOYMENT_ID=$(date +%s)
+          echo "Simulating deployment to nonprod environment..."
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          echo "Backend Image: ${{ env.BACKEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }}"
+          echo "Frontend Image: ${{ env.FRONTEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }}"
+          echo "deployment-id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for rollout
+        run: |
+          echo "Waiting for deployment rollout..."
+          # kubectl rollout status deployment/backend -n ${{ env.NAMESPACE }} --timeout=300s
+          # kubectl rollout status deployment/frontend -n ${{ env.NAMESPACE }} --timeout=300s
+          sleep 5
+
+  health-check:
+    name: Health Check Validation
+    runs-on: ubuntu-latest
+    needs: [promote-images, deploy]
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Run health checks
+        id: check
+        run: |
+          echo "Running health checks for nonprod environment..."
+
+          BACKEND_URL="https://api.nonprod.example.com"
+          FRONTEND_URL="https://nonprod.example.com"
+
+          check_health() {
+            local url=$1
+            local endpoint=$2
+            local retries=${{ env.HEALTH_CHECK_RETRIES }}
+            local delay=${{ env.HEALTH_CHECK_DELAY }}
+
+            for i in $(seq 1 $retries); do
+              echo "Health check attempt $i of $retries for $url$endpoint"
+
+              # Simulating health check - in real scenario use curl
+              # response=$(curl -s -o /dev/null -w "%{http_code}" "$url$endpoint" || echo "000")
+              response="200"
+
+              if [ "$response" = "200" ]; then
+                echo "✅ Health check passed for $url$endpoint"
+                return 0
+              fi
+
+              echo "Health check failed (HTTP $response), retrying in ${delay}s..."
+              sleep $delay
+            done
+
+            echo "❌ Health check failed for $url$endpoint after $retries attempts"
+            return 1
+          }
+
+          echo "Checking backend liveness..."
+          check_health "$BACKEND_URL" "/health/live" || BACKEND_LIVE=false
+
+          echo "Checking backend readiness..."
+          check_health "$BACKEND_URL" "/health/ready" || BACKEND_READY=false
+
+          echo "Checking frontend..."
+          check_health "$FRONTEND_URL" "/" || FRONTEND_READY=false
+
+          if [ "$BACKEND_LIVE" = "false" ] || [ "$BACKEND_READY" = "false" ] || [ "$FRONTEND_READY" = "false" ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ All health checks passed!"
+
+      - name: Record health check metrics
+        if: always()
+        run: |
+          echo "Recording health check metrics..."
+          echo "Deployment ID: ${{ needs.deploy.outputs.deployment-id }}"
+          echo "Health Check Status: ${{ steps.check.outputs.status }}"
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [promote-images, deploy, health-check]
+    if: failure() && needs.health-check.result == 'failure'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - name: Initiate rollback
+        run: |
+          echo "🔄 Health check failed, initiating rollback..."
+          echo "Previous tag: ${{ needs.deploy.outputs.previous-tag }}"
+
+          # kubectl rollout undo deployment/backend -n ${{ env.NAMESPACE }}
+          # kubectl rollout undo deployment/frontend -n ${{ env.NAMESPACE }}
+
+          echo "Simulating rollback to previous deployment..."
+
+      - name: Wait for rollback completion
+        run: |
+          echo "Waiting for rollback to complete..."
+          sleep 5
+          echo "✅ Rollback completed successfully"
+
+      - name: Notify rollback
+        run: |
+          echo "📢 Rollback notification:"
+          echo "Environment: ${{ env.ENVIRONMENT }}"
+          echo "Failed Deployment ID: ${{ needs.deploy.outputs.deployment-id }}"
+          echo "Rolled back from: ${{ needs.promote-images.outputs.image-tag }}"
+          echo "Reason: Health check validation failed"
+
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [promote-images, deploy, health-check]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## CD NonProd Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | NonProd |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment ID | ${{ needs.deploy.outputs.deployment-id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Tag | ${{ needs.promote-images.outputs.source-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | ${{ needs.promote-images.outputs.image-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Check | ${{ needs.health-check.outputs.status || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.health-check.result }}" = "success" ]; then
+            echo "### ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            echo "The application has been successfully deployed to the nonprod environment." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.health-check.result }}" = "failure" ]; then
+            echo "### ❌ Deployment Failed - Rolled Back" >> $GITHUB_STEP_SUMMARY
+            echo "Health checks failed. The deployment has been automatically rolled back." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Deployment Status Unknown" >> $GITHUB_STEP_SUMMARY
+          fi

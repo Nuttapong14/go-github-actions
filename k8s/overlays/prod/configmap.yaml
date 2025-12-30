@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: prod
+data:
+  api-url: "https://api.prod.example.com"

@@ -1,0 +1,318 @@
+# Hotfix Workflow
+# Expedites production fixes while keeping approval gates
+
+name: Hotfix
+
+on:
+  push:
+    branches:
+      - 'hotfix/**'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Optional image tag to deploy (default: short SHA)'
+        required: false
+        default: ''
+
+concurrency:
+  group: hotfix
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+  KUSTOMIZE_VERSION: v5.3.0
+  ENVIRONMENT: prod
+  NAMESPACE: prod
+  HEALTH_CHECK_RETRIES: 5
+  HEALTH_CHECK_DELAY: 10
+
+jobs:
+  build-images:
+    name: Build Hotfix Images
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/hotfix/')
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.BACKEND_IMAGE }}:hotfix-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.tag.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/frontend.Dockerfile
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.FRONTEND_IMAGE }}:hotfix-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://api.prod.example.com
+
+  deploy:
+    name: Deploy Hotfix to Prod
+    runs-on: ubuntu-latest
+    needs: build-images
+    permissions:
+      contents: read
+    environment:
+      name: prod
+      url: https://prod.example.com
+    outputs:
+      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
+      previous-tag: ${{ steps.current.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - name: Get current deployment tag (for rollback)
+        id: current
+        run: |
+          echo "tag=previous-${{ needs.build-images.outputs.image-tag }}" >> $GITHUB_OUTPUT
+
+      - name: Update Kustomize images
+        run: |
+          cd k8s/overlays/prod
+          kustomize edit set image \
+            backend=${{ env.BACKEND_IMAGE }}:${{ needs.build-images.outputs.image-tag }} \
+            frontend=${{ env.FRONTEND_IMAGE }}:${{ needs.build-images.outputs.image-tag }}
+
+      - name: Validate Kustomize build
+        run: |
+          kustomize build k8s/overlays/prod > /tmp/manifests.yaml
+          echo "Generated manifests:"
+          cat /tmp/manifests.yaml
+
+      - name: Deploy to cluster
+        id: deploy
+        run: |
+          # kubectl apply -k k8s/overlays/prod
+
+          DEPLOYMENT_ID=$(date +%s)
+          echo "Simulating hotfix deployment to prod environment..."
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          echo "Backend Image: ${{ env.BACKEND_IMAGE }}:${{ needs.build-images.outputs.image-tag }}"
+          echo "Frontend Image: ${{ env.FRONTEND_IMAGE }}:${{ needs.build-images.outputs.image-tag }}"
+          echo "deployment-id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for rollout
+        run: |
+          echo "Waiting for deployment rollout..."
+          # kubectl rollout status deployment/backend -n ${{ env.NAMESPACE }} --timeout=120s
+          # kubectl rollout status deployment/frontend -n ${{ env.NAMESPACE }} --timeout=120s
+          sleep 5
+
+  health-check:
+    name: Health Check Validation
+    runs-on: ubuntu-latest
+    needs: [build-images, deploy]
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Run health checks
+        id: check
+        run: |
+          echo "Running health checks for prod environment..."
+
+          BACKEND_URL="https://api.prod.example.com"
+          FRONTEND_URL="https://prod.example.com"
+
+          check_health() {
+            local url=$1
+            local endpoint=$2
+            local retries=${{ env.HEALTH_CHECK_RETRIES }}
+            local delay=${{ env.HEALTH_CHECK_DELAY }}
+
+            for i in $(seq 1 $retries); do
+              echo "Health check attempt $i of $retries for $url$endpoint"
+
+              # Simulating health check - in real scenario use curl
+              # response=$(curl -s -o /dev/null -w "%{http_code}" "$url$endpoint" || echo "000")
+              response="200"
+
+              if [ "$response" = "200" ]; then
+                echo "✅ Health check passed for $url$endpoint"
+                return 0
+              fi
+
+              echo "Health check failed (HTTP $response), retrying in ${delay}s..."
+              sleep $delay
+            done
+
+            echo "❌ Health check failed for $url$endpoint after $retries attempts"
+            return 1
+          }
+
+          echo "Checking backend liveness..."
+          check_health "$BACKEND_URL" "/health/live" || BACKEND_LIVE=false
+
+          echo "Checking backend readiness..."
+          check_health "$BACKEND_URL" "/health/ready" || BACKEND_READY=false
+
+          echo "Checking frontend..."
+          check_health "$FRONTEND_URL" "/" || FRONTEND_READY=false
+
+          if [ "$BACKEND_LIVE" = "false" ] || [ "$BACKEND_READY" = "false" ] || [ "$FRONTEND_READY" = "false" ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ All health checks passed!"
+
+      - name: Record health check metrics
+        if: always()
+        run: |
+          echo "Recording health check metrics..."
+          echo "Deployment ID: ${{ needs.deploy.outputs.deployment-id }}"
+          echo "Health Check Status: ${{ steps.check.outputs.status }}"
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [build-images, deploy, health-check]
+    if: failure() && needs.health-check.result == 'failure'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - name: Initiate rollback
+        run: |
+          echo "🔄 Health check failed, initiating rollback..."
+          echo "Previous tag: ${{ needs.deploy.outputs.previous-tag }}"
+
+          # kubectl rollout undo deployment/backend -n ${{ env.NAMESPACE }}
+          # kubectl rollout undo deployment/frontend -n ${{ env.NAMESPACE }}
+
+          echo "Simulating rollback to previous deployment..."
+
+      - name: Wait for rollback completion
+        run: |
+          echo "Waiting for rollback to complete..."
+          # kubectl rollout status deployment/backend -n ${{ env.NAMESPACE }} --timeout=120s
+          sleep 5
+          echo "✅ Rollback completed successfully"
+
+      - name: Notify rollback
+        run: |
+          echo "📢 Rollback notification:"
+          echo "Environment: ${{ env.ENVIRONMENT }}"
+          echo "Failed Deployment ID: ${{ needs.deploy.outputs.deployment-id }}"
+          echo "Rolled back from: ${{ needs.build-images.outputs.image-tag }}"
+          echo "Reason: Health check validation failed"
+
+  backport:
+    name: Backport to Develop
+    runs-on: ubuntu-latest
+    needs: [deploy, health-check]
+    if: needs.health-check.result == 'success'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Create backport PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          existing=$(gh pr list --repo "$REPO" --base develop --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Backport PR already exists: #$existing"
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "$REPO" \
+            --base develop \
+            --head "$BRANCH" \
+            --title "Backport hotfix: $BRANCH" \
+            --body "Automated backport of hotfix branch $BRANCH into develop."
+
+  summary:
+    name: Hotfix Summary
+    runs-on: ubuntu-latest
+    needs: [build-images, deploy, health-check, backport]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Hotfix Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Prod |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment ID | ${{ needs.deploy.outputs.deployment-id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | ${{ needs.build-images.outputs.image-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Check | ${{ needs.health-check.outputs.status || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.health-check.result }}" = "success" ]; then
+            echo "### ✅ Hotfix Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            echo "The application has been successfully deployed to production." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.health-check.result }}" = "failure" ]; then
+            echo "### ❌ Hotfix Deployment Failed - Rolled Back" >> $GITHUB_STEP_SUMMARY
+            echo "Health checks failed. The deployment has been automatically rolled back." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Hotfix Deployment Status Unknown" >> $GITHUB_STEP_SUMMARY
+          fi

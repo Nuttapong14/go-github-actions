@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        environment: prod
+    spec:
+      containers:
+        - name: frontend
+          env:
+            - name: NEXT_PUBLIC_ENVIRONMENT
+              value: "prod"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "1"

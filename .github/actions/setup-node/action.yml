@@ -1,0 +1,116 @@
+# Node.js Setup Composite Action
+# Reusable action for setting up Node.js and Bun development environment
+# Includes caching, dependency installation, and tool setup
+#
+# Usage:
+#   steps:
+#     - uses: ./.github/actions/setup-node
+#       with:
+#         node-version: '22'
+#         working-directory: frontend
+
+name: 'Setup Node.js Environment'
+description: 'Setup Node.js and Bun with caching for CI/CD'
+
+inputs:
+  node-version:
+    description: 'Node.js version to install'
+    required: false
+    default: '22'
+  bun-version:
+    description: 'Bun version to install'
+    required: false
+    default: 'latest'
+  working-directory:
+    description: 'Working directory for npm/bun commands'
+    required: false
+    default: 'frontend'
+  install-dependencies:
+    description: 'Install dependencies after setup'
+    required: false
+    default: 'true'
+  frozen-lockfile:
+    description: 'Use frozen lockfile for installs'
+    required: false
+    default: 'true'
+
+outputs:
+  node-version:
+    description: 'Installed Node.js version'
+    value: ${{ steps.setup-node.outputs.node-version }}
+  bun-version:
+    description: 'Installed Bun version'
+    value: ${{ steps.setup-bun.outputs.bun-version }}
+  cache-hit:
+    description: 'Whether the cache was hit'
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      id: setup-node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Setup Bun
+      id: setup-bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: ${{ inputs.bun-version }}
+
+    - name: Verify installations
+      shell: bash
+      run: |
+        echo "Node.js version: $(node --version)"
+        echo "npm version: $(npm --version)"
+        echo "Bun version: $(bun --version)"
+
+    - name: Cache dependencies
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.working-directory }}/node_modules
+          ~/.bun/install/cache
+        key: node-${{ runner.os }}-${{ inputs.node-version }}-${{ hashFiles(format('{0}/bun.lockb', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+        restore-keys: |
+          node-${{ runner.os }}-${{ inputs.node-version }}-
+          node-${{ runner.os }}-
+
+    - name: Install dependencies
+      if: inputs.install-dependencies == 'true' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Installing dependencies with Bun..."
+        if [ "${{ inputs.frozen-lockfile }}" == "true" ]; then
+          bun install --frozen-lockfile
+        else
+          bun install
+        fi
+        echo "Dependencies installed successfully"
+
+    - name: Verify dependencies (cache hit)
+      if: inputs.install-dependencies == 'true' && steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Using cached dependencies"
+        # Verify node_modules exists
+        if [ ! -d "node_modules" ]; then
+          echo "Cache corrupted, reinstalling..."
+          bun install --frozen-lockfile
+        else
+          echo "Cache valid, node_modules present"
+        fi
+
+    - name: Cache Next.js build
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.working-directory }}/.next/cache
+        key: nextjs-${{ runner.os }}-${{ hashFiles(format('{0}/**/package-lock.json', inputs.working-directory), format('{0}/**/bun.lockb', inputs.working-directory)) }}-${{ hashFiles(format('{0}/**/*.ts', inputs.working-directory), format('{0}/**/*.tsx', inputs.working-directory)) }}
+        restore-keys: |
+          nextjs-${{ runner.os }}-${{ hashFiles(format('{0}/**/package-lock.json', inputs.working-directory), format('{0}/**/bun.lockb', inputs.working-directory)) }}-
+          nextjs-${{ runner.os }}-

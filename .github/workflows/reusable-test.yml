@@ -1,0 +1,165 @@
+# Reusable Test Workflow
+# Runs tests with coverage for both backend (Go) and frontend (TypeScript/React)
+# Called by main CI workflow
+#
+# Usage:
+#   jobs:
+#     test:
+#       uses: ./.github/workflows/reusable-test.yml
+#       with:
+#         go-version: '1.23'
+#         node-version: '22'
+#         coverage-threshold: 80
+
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: 'Go version to use'
+        required: false
+        type: string
+        default: '1.23'
+      node-version:
+        description: 'Node.js version to use'
+        required: false
+        type: string
+        default: '22'
+      coverage-threshold:
+        description: 'Minimum code coverage percentage'
+        required: false
+        type: number
+        default: 80
+    outputs:
+      backend-coverage:
+        description: 'Backend code coverage percentage'
+        value: ${{ jobs.backend-test.outputs.coverage }}
+      frontend-coverage:
+        description: 'Frontend code coverage percentage'
+        value: ${{ jobs.frontend-test.outputs.coverage }}
+
+jobs:
+  backend-test:
+    name: Backend Tests (Go)
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.coverage.outputs.percentage }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests with race detection
+        run: |
+          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Generate coverage report
+        id: coverage
+        run: |
+          # Extract coverage percentage
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "Coverage: $COVERAGE%"
+
+          # Generate HTML report
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE="${{ steps.coverage.outputs.percentage }}"
+          THRESHOLD=${{ inputs.coverage-threshold }}
+
+          # Compare as integers (remove decimal part)
+          COVERAGE_INT=$(echo "$COVERAGE" | cut -d'.' -f1)
+
+          if [ "$COVERAGE_INT" -lt "$THRESHOLD" ]; then
+            echo "Coverage ($COVERAGE%) is below threshold ($THRESHOLD%)"
+            exit 1
+          fi
+          echo "Coverage ($COVERAGE%) meets threshold ($THRESHOLD%)"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: |
+            backend/coverage.out
+            backend/coverage.html
+          retention-days: 7
+
+      - name: Generate test report for SonarCloud
+        run: |
+          go test -v -race -json ./... > test-report.json 2>&1 || true
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-report
+          path: backend/test-report.json
+          retention-days: 7
+
+  frontend-test:
+    name: Frontend Tests (TypeScript)
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.coverage.outputs.percentage }}
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run tests with coverage
+        run: bun test --coverage
+
+      - name: Extract coverage
+        id: coverage
+        run: |
+          # Try to extract coverage from bun test output
+          # Default to 0 if coverage info is not available
+          COVERAGE="0"
+          if [ -f "coverage/lcov.info" ]; then
+            # Parse lcov.info for line coverage
+            TOTAL_LINES=$(grep -c "^DA:" coverage/lcov.info 2>/dev/null || echo "0")
+            COVERED_LINES=$(grep "^DA:" coverage/lcov.info 2>/dev/null | grep -v ",0$" | wc -l || echo "0")
+            if [ "$TOTAL_LINES" -gt 0 ]; then
+              COVERAGE=$(echo "scale=2; $COVERED_LINES * 100 / $TOTAL_LINES" | bc)
+            fi
+          fi
+          echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "Coverage: $COVERAGE%"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          retention-days: 7

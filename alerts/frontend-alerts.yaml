@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: frontend-alerts
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: cicd-training
+spec:
+  groups:
+    - name: frontend.rules
+      rules:
+        - alert: FrontendDown
+          expr: up{job="frontend"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Frontend is down"
+            description: "No healthy frontend targets for 2 minutes."
+
+        - alert: FrontendHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{job="frontend",status=~"5.."}[5m]))
+              /
+            sum(rate(http_requests_total{job="frontend"}[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High frontend error rate"
+            description: "5xx error rate is above 5% for 5 minutes."
+
+        - alert: FrontendLatencyHigh
+          expr: |
+            histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="frontend"}[5m])) by (le)) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High frontend latency"
+            description: "p95 latency over 1s for 10 minutes."

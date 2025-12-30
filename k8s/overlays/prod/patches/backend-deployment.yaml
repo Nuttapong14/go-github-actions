@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        environment: prod
+    spec:
+      containers:
+        - name: backend
+          env:
+            - name: ENVIRONMENT
+              value: "prod"
+            - name: LOG_LEVEL
+              value: "warn"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "1"

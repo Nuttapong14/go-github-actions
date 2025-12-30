@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: nonprod
+data:
+  api-url: "https://api.nonprod.example.com"

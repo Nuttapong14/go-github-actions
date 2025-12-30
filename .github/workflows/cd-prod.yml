@@ -1,0 +1,355 @@
+# CD Prod Deployment Workflow
+# Manual promotion from nonprod to prod with soak period enforcement and canary rollout
+# Uses pre-built images and promotes by retagging
+
+name: CD Prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to promote (default: latest)'
+        required: false
+        default: 'latest'
+      nonprod_deployed_at:
+        description: 'Optional ISO timestamp for last nonprod deploy (defaults to last cd-nonprod run)'
+        required: false
+        default: ''
+
+concurrency:
+  group: cd-prod
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+  KUSTOMIZE_VERSION: v5.3.0
+  ENVIRONMENT: prod
+  NAMESPACE: prod
+  HEALTH_CHECK_RETRIES: 5
+  HEALTH_CHECK_DELAY: 10
+  SOAK_HOURS: 24
+  CANARY_REPLICAS: 1
+  FULL_REPLICAS: 3
+
+jobs:
+  soak-check:
+    name: Enforce Soak Period
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      nonprod-timestamp: ${{ steps.check.outputs.timestamp }}
+    steps:
+      - name: Check soak period (24h)
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SOAK_START="${{ inputs.nonprod_deployed_at }}"
+
+          if [ -z "$SOAK_START" ]; then
+            api_url="https://api.github.com/repos/${{ github.repository }}/actions/workflows/cd-nonprod.yml/runs?status=success&per_page=1"
+            response=$(curl -sSf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$api_url")
+            SOAK_START=$(echo "$response" | jq -r '.workflow_runs[0].updated_at')
+          fi
+
+          if [ -z "$SOAK_START" ] || [ "$SOAK_START" = "null" ]; then
+            echo "No successful nonprod deployment found. Run cd-nonprod first."
+            exit 1
+          fi
+
+          now=$(date -u +%s)
+          start_epoch=$(date -u -d "$SOAK_START" +%s)
+          diff_hours=$(( (now - start_epoch) / 3600 ))
+
+          echo "timestamp=$SOAK_START" >> $GITHUB_OUTPUT
+          echo "Nonprod deployment timestamp: $SOAK_START"
+          echo "Hours since nonprod deployment: $diff_hours"
+
+          if [ "$diff_hours" -lt "${{ env.SOAK_HOURS }}" ]; then
+            echo "Soak period not met. Required: ${{ env.SOAK_HOURS }}h, current: ${diff_hours}h."
+            exit 1
+          fi
+
+          echo "✅ Soak period requirement met."
+
+  promote-images:
+    name: Promote Images
+    runs-on: ubuntu-latest
+    needs: soak-check
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      source-tag: ${{ steps.tag.outputs.source }}
+      image-tag: ${{ steps.tag.outputs.promoted }}
+    steps:
+      - name: Set image tag
+        id: tag
+        run: |
+          SOURCE_TAG="${{ inputs.image_tag }}"
+          if [ -z "$SOURCE_TAG" ]; then
+            SOURCE_TAG="latest"
+          fi
+          PROMOTED_TAG="prod-${SOURCE_TAG}"
+          echo "source=$SOURCE_TAG" >> $GITHUB_OUTPUT
+          echo "promoted=$PROMOTED_TAG" >> $GITHUB_OUTPUT
+          echo "Promoting tag: $SOURCE_TAG -> $PROMOTED_TAG"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote backend image
+        run: |
+          docker pull ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.source }}
+          docker tag ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker tag ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.BACKEND_IMAGE }}:prod-latest
+          docker push ${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker push ${{ env.BACKEND_IMAGE }}:prod-latest
+
+      - name: Promote frontend image
+        run: |
+          docker pull ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.source }}
+          docker tag ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker tag ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.source }} ${{ env.FRONTEND_IMAGE }}:prod-latest
+          docker push ${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.promoted }}
+          docker push ${{ env.FRONTEND_IMAGE }}:prod-latest
+
+  deploy-canary:
+    name: Deploy Canary
+    runs-on: ubuntu-latest
+    needs: promote-images
+    permissions:
+      contents: read
+    environment:
+      name: prod
+      url: https://prod.example.com
+    outputs:
+      deployment-id: ${{ steps.deploy.outputs.deployment-id }}
+      previous-tag: ${{ steps.current.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - name: Get current deployment tag (for rollback)
+        id: current
+        run: |
+          # In a real scenario, this would query the cluster
+          echo "tag=previous-${{ needs.promote-images.outputs.image-tag }}" >> $GITHUB_OUTPUT
+
+      - name: Update Kustomize images
+        run: |
+          cd k8s/overlays/prod
+          kustomize edit set image \
+            backend=${{ env.BACKEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }} \
+            frontend=${{ env.FRONTEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }}
+
+      - name: Validate Kustomize build
+        run: |
+          kustomize build k8s/overlays/prod > /tmp/manifests.yaml
+          echo "Generated manifests:"
+          cat /tmp/manifests.yaml
+
+      - name: Deploy canary to cluster
+        id: deploy
+        run: |
+          # In a real scenario, this would apply to the cluster:
+          # kubectl apply -k k8s/overlays/prod
+
+          DEPLOYMENT_ID=$(date +%s)
+          echo "Simulating canary deployment to prod environment..."
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          echo "Backend Image: ${{ env.BACKEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }}"
+          echo "Frontend Image: ${{ env.FRONTEND_IMAGE }}:${{ needs.promote-images.outputs.image-tag }}"
+          echo "deployment-id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+
+          echo "Scaling deployments to canary replicas: ${{ env.CANARY_REPLICAS }}"
+          # kubectl scale deployment/backend -n ${{ env.NAMESPACE }} --replicas=${{ env.CANARY_REPLICAS }}
+          # kubectl scale deployment/frontend -n ${{ env.NAMESPACE }} --replicas=${{ env.CANARY_REPLICAS }}
+
+      - name: Wait for canary rollout
+        run: |
+          echo "Waiting for canary rollout..."
+          sleep 5
+
+  canary-health-check:
+    name: Canary Health Check
+    runs-on: ubuntu-latest
+    needs: [promote-images, deploy-canary]
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Run health checks
+        id: check
+        run: |
+          echo "Running canary health checks for prod environment..."
+
+          BACKEND_URL="https://api.prod.example.com"
+          FRONTEND_URL="https://prod.example.com"
+
+          check_health() {
+            local url=$1
+            local endpoint=$2
+            local retries=${{ env.HEALTH_CHECK_RETRIES }}
+            local delay=${{ env.HEALTH_CHECK_DELAY }}
+
+            for i in $(seq 1 $retries); do
+              echo "Health check attempt $i of $retries for $url$endpoint"
+
+              # Simulating health check - in real scenario use curl
+              # response=$(curl -s -o /dev/null -w "%{http_code}" "$url$endpoint" || echo "000")
+              response="200"
+
+              if [ "$response" = "200" ]; then
+                echo "✅ Health check passed for $url$endpoint"
+                return 0
+              fi
+
+              echo "Health check failed (HTTP $response), retrying in ${delay}s..."
+              sleep $delay
+            done
+
+            echo "❌ Health check failed for $url$endpoint after $retries attempts"
+            return 1
+          }
+
+          echo "Checking backend liveness..."
+          check_health "$BACKEND_URL" "/health/live" || BACKEND_LIVE=false
+
+          echo "Checking backend readiness..."
+          check_health "$BACKEND_URL" "/health/ready" || BACKEND_READY=false
+
+          echo "Checking frontend..."
+          check_health "$FRONTEND_URL" "/" || FRONTEND_READY=false
+
+          if [ "$BACKEND_LIVE" = "false" ] || [ "$BACKEND_READY" = "false" ] || [ "$FRONTEND_READY" = "false" ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Canary health checks passed!"
+
+  deploy-full:
+    name: Promote Canary to Full Rollout
+    runs-on: ubuntu-latest
+    needs: [deploy-canary, canary-health-check]
+    if: needs.canary-health-check.result == 'success'
+    steps:
+      - name: Scale to full replicas
+        run: |
+          echo "Scaling deployments to full replicas: ${{ env.FULL_REPLICAS }}"
+          # kubectl scale deployment/backend -n ${{ env.NAMESPACE }} --replicas=${{ env.FULL_REPLICAS }}
+          # kubectl scale deployment/frontend -n ${{ env.NAMESPACE }} --replicas=${{ env.FULL_REPLICAS }}
+          sleep 5
+
+  full-health-check:
+    name: Full Rollout Health Check
+    runs-on: ubuntu-latest
+    needs: [deploy-full]
+    if: needs.deploy-full.result == 'success'
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Run health checks
+        id: check
+        run: |
+          echo "Running full rollout health checks for prod environment..."
+
+          BACKEND_URL="https://api.prod.example.com"
+          FRONTEND_URL="https://prod.example.com"
+
+          # Simulating health check - in real scenario use curl
+          response="200"
+
+          if [ "$response" != "200" ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Full rollout health checks passed!"
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [promote-images, deploy-canary, canary-health-check, deploy-full, full-health-check]
+    if: failure() && (needs.canary-health-check.result == 'failure' || needs.full-health-check.result == 'failure')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
+
+      - name: Initiate rollback
+        run: |
+          echo "🔄 Deployment failed, initiating rollback..."
+          echo "Previous tag: ${{ needs.deploy-canary.outputs.previous-tag }}"
+
+          # kubectl rollout undo deployment/backend -n ${{ env.NAMESPACE }}
+          # kubectl rollout undo deployment/frontend -n ${{ env.NAMESPACE }}
+
+          echo "Simulating rollback to previous deployment..."
+
+      - name: Wait for rollback completion
+        run: |
+          echo "Waiting for rollback to complete..."
+          sleep 5
+          echo "✅ Rollback completed successfully"
+
+      - name: Notify rollback
+        run: |
+          echo "📢 Rollback notification:"
+          echo "Environment: ${{ env.ENVIRONMENT }}"
+          echo "Failed Deployment ID: ${{ needs.deploy-canary.outputs.deployment-id }}"
+          echo "Rolled back from: ${{ needs.promote-images.outputs.image-tag }}"
+          echo "Reason: Canary/full rollout health check failed"
+
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [soak-check, promote-images, deploy-canary, canary-health-check, deploy-full, full-health-check]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## CD Prod Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Prod |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment ID | ${{ needs.deploy-canary.outputs.deployment-id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Tag | ${{ needs.promote-images.outputs.source-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | ${{ needs.promote-images.outputs.image-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Soak Start | ${{ needs.soak-check.outputs.nonprod-timestamp || 'unknown' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Canary Check | ${{ needs.canary-health-check.outputs.status || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Full Rollout Check | ${{ needs.full-health-check.outputs.status || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.full-health-check.result }}" = "success" ]; then
+            echo "### ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            echo "The application has been successfully deployed to production." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.canary-health-check.result }}" = "failure" ] || [ "${{ needs.full-health-check.result }}" = "failure" ]; then
+            echo "### ❌ Deployment Failed - Rolled Back" >> $GITHUB_STEP_SUMMARY
+            echo "Canary/full health checks failed. The deployment has been rolled back." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Deployment Status Unknown" >> $GITHUB_STEP_SUMMARY
+          fi
